@@ -1,0 +1,286 @@
+<!DOCTYPE html>
+<html lang="en">
+	<head>
+		<title>three.js webgl - Foliage Subtle Wind Shader on Sphere</title>
+		<meta charset="utf-8">
+		<meta name="viewport" content="width=device-width, user-scalable=no, minimum-scale=1.0, maximum-scale=1.0">
+        <style>
+            body { margin: 0; }
+            canvas { display: block; }
+        </style>
+	</head>
+	<body>
+
+		<script type="module">
+
+			import * as THREE from 'https://unpkg.com/three@0.158.0/build/three.module.js';
+
+            // --- 1. GLSL Shader Code Strings ---
+
+			const vertexShaderCode = `
+                // Standard attributes (position, normal, uv) are included by three.js.
+
+                uniform float iTime;
+                
+                // Custom Uniforms for Wind
+                uniform float u_WindStrength;
+                uniform float u_WindSpeed;
+                uniform float u_WindScale;
+
+                // Varyings to Fragment Shader
+                varying vec2 vUv;
+                varying vec3 vNormal;
+                varying vec3 vPositionW; // World Position
+                
+                void main() {
+                    
+                    vUv = uv; 
+                    
+                    // --- Sphere Wind Deformation ---
+                    
+                    // 1. Get the mask from uv2.y (set in JS to mask the bottom of the sphere)
+                    float mask = uv2.y; 
+
+                    // 2. Calculate the wave magnitude based on time and horizontal position
+                    // Wave direction is a mix of X and Z position to create spatial noise.
+                    float waveMagnitude = sin(iTime * u_WindSpeed + position.x * u_WindScale + position.z * u_WindScale * 0.5);
+
+                    // 3. Scale the displacement and apply the mask
+                    // We use a small factor (0.25) to prevent extreme bulging.
+                    float displacement = waveMagnitude * u_WindStrength * 0.25 * mask; 
+                    
+                    // 4. Displace the vertex along its normal (away from the sphere center)
+                    vec3 finalPosition = position + normal * displacement; 
+
+                    // --- Standard three.js Transformation ---
+                    gl_Position = projectionMatrix * modelViewMatrix * vec4(finalPosition, 1.0);
+
+                    // Pass world position and original normal
+                    vPositionW = (modelMatrix * vec4(finalPosition, 1.0)).xyz;
+                    vNormal = normal; 
+                }
+            `;
+
+			const fragmentShaderCode = `
+                // Standard three.js Uniforms
+                uniform float iTime;
+                uniform vec3 viewPosition; 
+                
+                // Custom Uniforms 
+                uniform vec4 u_Color;
+                uniform sampler2D u_MainTex;
+                uniform sampler2D u_BumpMap;
+                uniform sampler2D u_MetallicMap;
+                uniform sampler2D u_RoughnessMap;
+                uniform sampler2D u_AOMap;
+
+                uniform float u_Metallic;
+                uniform float u_Glossiness;
+                uniform float u_RoughnessScale;
+                uniform float u_AOStrength;
+                uniform float u_Cutoff;
+                uniform float u_TranslucencyStrength;
+                uniform vec3 u_DirectionalLight; 
+
+                // Varyings from Vertex Shader
+                varying vec2 vUv;
+                varying vec3 vNormal;
+                varying vec3 vPositionW;
+
+                // --- Helper Functions ---
+
+                vec3 unpackNormal(sampler2D map, vec2 uv) {
+                    vec3 packed = texture2D(map, uv).xyz * 2.0 - 1.0; 
+                    return normalize(packed);
+                }
+                
+                vec3 applyPBR(vec3 albedo, vec3 normal, float metallic, float smoothness, float occlusion, vec3 lightDir, vec3 viewDir) {
+                    
+                    vec3 lightColor = vec3(1.0); 
+                    float NdotL = max(dot(normal, lightDir), 0.0);
+                    vec3 diffuse = albedo * lightColor * NdotL;
+                    
+                    float roughness = 1.0 - smoothness;
+                    vec3 halfDir = normalize(lightDir + viewDir);
+                    float NdotH = max(dot(normal, halfDir), 0.0);
+                    
+                    float F0 = metallic * 0.96 + 0.04; 
+                    float specularPower = exp2(smoothness * 10.0 + 1.0); 
+                    float specular = pow(NdotH, specularPower) * F0;
+                    vec3 finalSpecular = lightColor * specular * NdotL;
+                    
+                    vec3 ambient = albedo * occlusion * 0.15; 
+                    
+                    return ambient + diffuse + finalSpecular;
+                }
+
+
+                void main()
+                {
+                    // ----------------------------------------------------
+                    // I. SURFACE DATA
+                    // ----------------------------------------------------
+                    
+                    vec4 c = texture2D(u_MainTex, vUv) * u_Color;
+                    vec3 albedo = c.rgb;
+                    float alpha = c.a;
+
+                    if (alpha < u_Cutoff) {
+                        discard; 
+                    }
+
+                    vec3 normalFromMap = unpackNormal(u_BumpMap, vUv);
+                    vec3 normalW = normalize(vNormal + normalFromMap); 
+                    
+                    vec4 maskMap = texture2D(u_MetallicMap, vUv); 
+
+                    float metallicTex  = maskMap.r; 
+                    float roughnessTex = maskMap.g; 
+                    float aoTex        = maskMap.b; 
+
+                    float metallic = u_Metallic * metallicTex;
+                    float smoothness = u_Glossiness * (1.0 - roughnessTex * u_RoughnessScale);
+                    float occlusion = mix(1.0, aoTex, u_AOStrength); 
+
+                    // ----------------------------------------------------
+                    // II. LIGHTING & TRANSLUCENCY
+                    // ----------------------------------------------------
+                    
+                    vec3 lightDir = normalize(-u_DirectionalLight); 
+                    vec3 viewDir = normalize(viewPosition - vPositionW); 
+                    
+                    vec3 finalColor = applyPBR(albedo, normalW, metallic, smoothness, occlusion, lightDir, viewDir);
+
+                    float backLight = clamp(dot(-lightDir, normalW), 0.0, 1.0); 
+                    vec3 emission = albedo * backLight * u_TranslucencyStrength;
+                    
+                    finalColor += emission; 
+
+                    // ----------------------------------------------------
+                    // III. FINAL OUTPUT
+                    // ----------------------------------------------------
+                    
+                    gl_FragColor = vec4(pow(finalColor, vec3(1.0/2.2)), alpha); 
+                }
+            `;
+
+
+            // --- 2. three.js Setup and Logic (JavaScript) ---
+
+			let scene, camera, renderer, mesh, clock;
+            
+            const loader = new THREE.TextureLoader();
+
+            // All PNG textures
+            const mainTexture = loader.load('./Foliage_BaseMap.png');
+            const bumpTexture = loader.load('./Foliage_Normal.png');
+            const maskTexture = loader.load('./Foliage_MaskMap.png'); 
+
+			init();
+			animate();
+
+			function init() {
+				// Scene Setup
+				scene = new THREE.Scene();
+				camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+                camera.position.set(0, 2, 5);
+                camera.lookAt(0, 0.5, 0);
+				
+				// Renderer
+				renderer = new THREE.WebGLRenderer({ antialias: true });
+				renderer.setSize(window.innerWidth, window.innerHeight);
+				document.body.appendChild(renderer.domElement);
+				
+				clock = new THREE.Clock();
+
+				// --- Uniforms Definition ---
+				const customUniforms = {
+					iTime: { value: 0 },
+                    viewPosition: { value: camera.position }, 
+                    u_DirectionalLight: { value: new THREE.Vector3(-0.5, 1.0, -0.5).normalize() }, 
+                    
+                    // Texture Uniforms
+                    u_MainTex: { value: mainTexture },
+                    u_BumpMap: { value: bumpTexture },
+                    u_MetallicMap: { value: maskTexture }, 
+                    u_RoughnessMap: { value: maskTexture },
+                    u_AOMap: { value: maskTexture },
+
+                    // Color and Scalars
+                    u_Color: { value: new THREE.Vector4(1, 1, 1, 1) },
+                    u_Metallic: { value: 0.0 }, 
+                    u_Glossiness: { value: 0.5 },
+                    u_RoughnessScale: { value: 1.0 },
+                    u_AOStrength: { value: 0.3 },
+                    u_Cutoff: { value: 0.5 },
+                    u_TranslucencyStrength: { value: 0.5 },
+
+                    // Wind Parameters
+                    u_WindStrength: { value: 0.3 }, // 0.05, Increase to 0.1 for double the bending
+                    u_WindSpeed: { value: 6.0 },     // 1.5, Increase to 3.0 for double the animation speed
+                    u_WindScale: { value: 0.5 },     // 2.0, Decrease to 0.5 for large, gentle waves
+				};
+
+				// Material
+				const shaderMaterial = new THREE.ShaderMaterial({
+					uniforms: customUniforms,
+					vertexShader: vertexShaderCode,
+					fragmentShader: fragmentShaderCode,
+					lights: false, 
+					side: THREE.DoubleSide, 
+				});
+
+				// 🟢 Sphere Geometry
+				const radius = 2; 
+				const widthSegments = 64; 
+				const heightSegments = 64; 
+				const geometry = new THREE.SphereGeometry(radius, widthSegments, heightSegments); 
+				
+                // Add uv2 attribute
+                geometry.setAttribute('uv2', geometry.attributes.uv.clone()); 
+
+                // Custom UV2 Masking (0 at equator, 1 at top pole)
+                const positions = geometry.attributes.position.array;
+                const uv2s = geometry.attributes.uv2.array;
+
+                for (let i = 0; i < positions.length; i += 3) {
+                    const y = positions[i + 1]; // Y-coordinate is the vertical axis
+                    // Remap Y from [-radius, +radius] to [0, 1], then to [0, 1] for the upper half.
+                    let maskValue = (y / radius) * 0.5 + 0.5; 
+                    maskValue = Math.max(0, maskValue * 2 - 1); 
+                    uv2s[i / 3 * 2 + 1] = maskValue; 
+                }
+
+                mesh = new THREE.Mesh(geometry, shaderMaterial);
+				scene.add(mesh);
+
+				// Add a basic white ambient light
+                scene.add(new THREE.AmbientLight(0xffffff, 0.5));
+
+				window.addEventListener('resize', onWindowResize, false);
+			}
+
+			function onWindowResize() {
+				camera.aspect = window.innerWidth / window.innerHeight;
+				camera.updateProjectionMatrix();
+				renderer.setSize(window.innerWidth, window.innerHeight);
+			}
+
+			function animate() {
+				requestAnimationFrame(animate);
+
+				if (mesh) {
+					// Update iTime
+					mesh.material.uniforms.iTime.value = clock.getElapsedTime();
+                    
+                    // 🟢 ADDED: Slow rotation around the Y-axis
+                    // 0.005 is a slow rotation speed (in radians per frame)
+                   // mesh.rotation.y += 0.005; 
+
+					renderer.render(scene, camera);
+				}
+			}
+
+		</script>
+	</body>
+</html>
